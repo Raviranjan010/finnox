@@ -128,7 +128,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         The list of labels.
     max_seq_length: int
         The maximum sequence length.
-    tokenizer: BertTokenizer
+    tokenizer: BertTokenizer or AutoTokenizer
         The tokenizer to be used.
     mode: str, optional
         The task type: 'classification' or 'regression'. Default is 'classification'
@@ -145,30 +145,17 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
 
     features = []
     for (ex_index, example) in enumerate(examples):
-        tokens = tokenizer.tokenize(example.text)
+        inputs = tokenizer(
+            example.text,
+            max_length=max_seq_length,
+            padding='max_length',
+            truncation=True
+        )
 
-        if len(tokens) > max_seq_length - 2:
-            tokens = tokens[:(max_seq_length // 4) - 1] + tokens[
-                                                          len(tokens) - (3 * max_seq_length // 4) + 1:]
-
-        tokens = ["[CLS]"] + tokens + ["[SEP]"]
-
-        token_type_ids = [0] * len(tokens)
-
-        input_ids = tokenizer.convert_tokens_to_ids(tokens)
-
-        attention_mask = [1] * len(input_ids)
-
-        padding = [0] * (max_seq_length - len(input_ids))
-        input_ids += padding
-        attention_mask += padding
-
-
-        token_type_ids += padding
-
-        assert len(input_ids) == max_seq_length
-        assert len(attention_mask) == max_seq_length
-        assert len(token_type_ids) == max_seq_length
+        input_ids = inputs['input_ids']
+        attention_mask = inputs['attention_mask']
+        # RoBERTa does not produce token_type_ids, default to zero list
+        token_type_ids = inputs.get('token_type_ids', [0] * max_seq_length)
 
         if mode == 'classification':
             label_id = label_map[example.label]
@@ -187,12 +174,9 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         if ex_index < 1:
             logger.info("*** Example ***")
             logger.info("guid: %s" % (example.guid))
-            logger.info("tokens: %s" % " ".join(
-                [str(x) for x in tokens]))
             logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
             logger.info("attention_mask: %s" % " ".join([str(x) for x in attention_mask]))
-            logger.info(
-                "token_type_ids: %s" % " ".join([str(x) for x in token_type_ids]))
+            logger.info("token_type_ids: %s" % " ".join([str(x) for x in token_type_ids]))
             logger.info("label: %s (id = %d)" % (example.label, label_id))
 
         features.append(
@@ -248,40 +232,39 @@ def get_prediction(text, model, tokenizer):
     ----------
     text: str
         The text to be analyzed.
-    model: BertModel
+    model: BertModel or SentimentEngine
         The model to be used.
-    tokenizer: BertTokenizer
+    tokenizer: BertTokenizer or AutoTokenizer
         The tokenizer to be used.
 
     Returns
     -------
-    predition: np.array
+    prediction: np.array
         An array that includes probabilities for each class.
     """
+    raw_model = model.model if hasattr(model, 'model') else model
 
-    tokens = tokenizer.tokenize(text)
-    tokens = ["[CLS]"] + tokens + ["[SEP]"]
-    token_type_ids = [0] * len(tokens)
-    attention_mask = [1] * len(tokens)
-    input_ids = tokenizer.convert_tokens_to_ids(tokens)
-    padding = [0] * (64 - len(input_ids))
-    input_ids += padding
-    attention_mask += padding
-    token_type_ids += padding
+    inputs = tokenizer(
+        text,
+        max_length=64,
+        padding='max_length',
+        truncation=True,
+        return_tensors="pt"
+    )
 
-    features = []
-    features.append(
-        InputFeatures(input_ids=input_ids,
-                      token_type_ids=token_type_ids,
-                      attention_mask=attention_mask,
-                      label_id=None))
+    device = next(raw_model.parameters()).device if hasattr(raw_model, 'parameters') and list(raw_model.parameters()) else torch.device("cpu")
+    input_ids = inputs['input_ids'].to(device)
+    attention_mask = inputs['attention_mask'].to(device)
 
-    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
-    all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
-    all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
+    raw_model.eval()
+    with torch.no_grad():
+        outputs = raw_model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
 
-    model.eval()
-    prediction = softmax(model(all_input_ids, all_attention_mask, all_token_type_ids).detach().numpy())
+        if hasattr(model, '_calibrator') and model._calibrator is not None:
+            logits = model._calibrator(logits)
+
+        prediction = softmax(logits.cpu().numpy())
     return prediction
 
 

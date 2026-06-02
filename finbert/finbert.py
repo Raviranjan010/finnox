@@ -1,8 +1,11 @@
 from __future__ import absolute_import, division, print_function
 
 import random
+import os
 
 import pandas as pd
+import torch
+import torch.nn as nn
 from torch.nn import MSELoss, CrossEntropyLoss
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
     TensorDataset)
@@ -14,11 +17,121 @@ import numpy as np
 import logging
 
 from transformers.optimization import AdamW, get_linear_schedule_with_warmup
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
 
 logger = logging.getLogger(__name__)
 
-tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+class TemperatureScaler(nn.Module):
+    """A simple temperature scaling calibrator for confidence calibration."""
+    def __init__(self):
+        super().__init__()
+        self.temperature = nn.Parameter(torch.ones(1))
+
+    def forward(self, logits):
+        return logits / self.temperature
+
+    def calibrate(self, logits, labels):
+        """
+        Calibrate temperature parameter using validation logits and labels.
+        """
+        optimizer = torch.optim.LBFGS([self.temperature], lr=0.01, max_iter=50)
+        criterion = nn.CrossEntropyLoss()
+
+        def eval_loss():
+            optimizer.zero_grad()
+            loss = criterion(self.forward(logits), labels)
+            loss.backward()
+            return loss
+
+        optimizer.step(eval_loss)
+
+class SentimentEngine:
+    """FinSential core — RoBERTa fine-tuned on multi-domain financial corpus"""
+    
+    MODEL_ID = "roberta-base"  # NOT bert-base-uncased like finBERT
+    LABELS = ["bullish", "bearish", "neutral", "uncertain"]  # 4-class, not 3
+    
+    def __init__(self, model_path: str = None):
+        actual_path = model_path
+        if model_path:
+            try:
+                # Check compatibility of local checkpoint
+                config = AutoConfig.from_pretrained(model_path)
+                if config.model_type != "roberta" or getattr(config, "num_labels", 0) != len(self.LABELS):
+                    logger.warning(f"Model at {model_path} is incompatible with RoBERTa 4-class labels. Falling back to {self.MODEL_ID}")
+                    actual_path = self.MODEL_ID
+            except Exception as e:
+                logger.warning(f"Failed to inspect model at {model_path}: {e}. Falling back to {self.MODEL_ID}")
+                actual_path = self.MODEL_ID
+
+        self.tokenizer = AutoTokenizer.from_pretrained(actual_path or self.MODEL_ID)
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            actual_path or self.MODEL_ID,
+            num_labels=len(self.LABELS)
+        )
+        self._calibrator = TemperatureScaler()  # NEW: confidence calibration
+
+        # If a local model_path was loaded, try to load any saved calibrator state
+        if actual_path and actual_path != self.MODEL_ID:
+            calibrator_file = os.path.join(actual_path, "calibrator.bin")
+            if os.path.exists(calibrator_file):
+                try:
+                    self._calibrator.load_state_dict(torch.load(calibrator_file, map_location="cpu"))
+                    logger.info(f"Loaded calibrator state from {calibrator_file}")
+                except Exception as e:
+                    logger.warning(f"Failed to load calibrator state: {e}")
+
+    def predict(self, text, write_to_csv=False, path=None, use_gpu=False, gpu_name='cuda:0', batch_size=5):
+        """
+        Predict sentiments of sentences in a given text.
+        """
+        self.model.eval()
+        sentences = sent_tokenize(text)
+        device = gpu_name if use_gpu and torch.cuda.is_available() else "cpu"
+        self.model.to(device)
+        self._calibrator.to(device)
+
+        label_dict = {i: label for i, label in enumerate(self.LABELS)}
+        result = pd.DataFrame(columns=['sentence', 'logit', 'prediction', 'sentiment_score'])
+
+        for batch in chunks(sentences, batch_size):
+            inputs = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=64,
+                return_tensors="pt"
+            ).to(device)
+
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=inputs['input_ids'],
+                    attention_mask=inputs['attention_mask']
+                )
+                logits = outputs.logits
+                calibrated_logits = self._calibrator(logits)
+                probs = torch.softmax(calibrated_logits, dim=-1).cpu().numpy()
+                sentiment_score = pd.Series(probs[:, 0] - probs[:, 1])  # bullish - bearish
+                predictions = np.argmax(probs, axis=1)
+
+                batch_result = {
+                    'sentence': batch,
+                    'logit': list(probs),
+                    'prediction': predictions,
+                    'sentiment_score': sentiment_score
+                }
+                batch_result = pd.DataFrame(batch_result)
+                result = pd.concat([result, batch_result], ignore_index=True)
+
+        result['prediction'] = result.prediction.apply(lambda x: label_dict[x])
+        if write_to_csv and path:
+            result.to_csv(path, sep=',', index=False)
+
+        return result
+
+# Default tokenizer for backwards compatibility, using roberta-base
+tokenizer = AutoTokenizer.from_pretrained("roberta-base")
+
 
 class Config(object):
     """The configuration class for training."""
@@ -43,7 +156,7 @@ class Config(object):
                  discriminate=True,
                  gradual_unfreeze=True,
                  encoder_no=12,
-                 base_model='bert-base-uncased'):
+                 base_model='roberta-base'):
         """
         Parameters
         ----------
@@ -224,16 +337,19 @@ class FinBert(object):
 
         if self.config.discriminate:
             # apply the discriminative fine-tuning. discrimination rate is governed by dft_rate.
+            base_model_obj = getattr(model, 'roberta', getattr(model, 'bert', None))
+            if base_model_obj is None:
+                raise ValueError("Model does not contain a recognized base model (bert or roberta)")
 
             encoder_params = []
-            for i in range(12):
+            for i in range(len(base_model_obj.encoder.layer)):
                 encoder_decay = {
-                    'params': [p for n, p in list(model.bert.encoder.layer[i].named_parameters()) if
+                    'params': [p for n, p in list(base_model_obj.encoder.layer[i].named_parameters()) if
                                not any(nd in n for nd in no_decay)],
                     'weight_decay': 0.01,
                     'lr': lr / (dft_rate ** (12 - i))}
                 encoder_nodecay = {
-                    'params': [p for n, p in list(model.bert.encoder.layer[i].named_parameters()) if
+                    'params': [p for n, p in list(base_model_obj.encoder.layer[i].named_parameters()) if
                                any(nd in n for nd in no_decay)],
                     'weight_decay': 0.0,
                     'lr': lr / (dft_rate ** (12 - i))}
@@ -241,22 +357,14 @@ class FinBert(object):
                 encoder_params.append(encoder_nodecay)
 
             optimizer_grouped_parameters = [
-                {'params': [p for n, p in list(model.bert.embeddings.named_parameters()) if
+                {'params': [p for n, p in list(base_model_obj.embeddings.named_parameters()) if
                             not any(nd in n for nd in no_decay)],
                  'weight_decay': 0.01,
                  'lr': lr / (dft_rate ** 13)},
-                {'params': [p for n, p in list(model.bert.embeddings.named_parameters()) if
+                {'params': [p for n, p in list(base_model_obj.embeddings.named_parameters()) if
                             any(nd in n for nd in no_decay)],
                  'weight_decay': 0.0,
                  'lr': lr / (dft_rate ** 13)},
-                {'params': [p for n, p in list(model.bert.pooler.named_parameters()) if
-                            not any(nd in n for nd in no_decay)],
-                 'weight_decay': 0.01,
-                 'lr': lr},
-                {'params': [p for n, p in list(model.bert.pooler.named_parameters()) if
-                            any(nd in n for nd in no_decay)],
-                 'weight_decay': 0.0,
-                 'lr': lr},
                 {'params': [p for n, p in list(model.classifier.named_parameters()) if
                             not any(nd in n for nd in no_decay)],
                  'weight_decay': 0.01,
@@ -264,6 +372,18 @@ class FinBert(object):
                 {'params': [p for n, p in list(model.classifier.named_parameters()) if any(nd in n for nd in no_decay)],
                  'weight_decay': 0.0,
                  'lr': lr}]
+
+            if hasattr(base_model_obj, 'pooler') and base_model_obj.pooler is not None:
+                optimizer_grouped_parameters.extend([
+                    {'params': [p for n, p in list(base_model_obj.pooler.named_parameters()) if
+                                not any(nd in n for nd in no_decay)],
+                     'weight_decay': 0.01,
+                     'lr': lr},
+                    {'params': [p for n, p in list(base_model_obj.pooler.named_parameters()) if
+                                any(nd in n for nd in no_decay)],
+                     'weight_decay': 0.0,
+                     'lr': lr}
+                ])
 
             optimizer_grouped_parameters.extend(encoder_params)
 
@@ -351,13 +471,11 @@ class FinBert(object):
         ----------
         examples: list
             Contains the data as a list of InputExample's
-        model: BertModel
-            The Bert model to be trained.
-        weights: list
-            Contains class weights.
+        model: BertModel or RobertaModel
+            The model to be trained.
         Returns
         -------
-        model: BertModel
+        model: BertModel or RobertaModel
             The trained model.
         """
 
@@ -384,32 +502,35 @@ class FinBert(object):
 
             for step, batch in enumerate(tqdm(train_dataloader, desc='Iteration')):
 
-                if (self.config.gradual_unfreeze and i == 0):
-                    for param in model.bert.parameters():
-                        param.requires_grad = False
+                base_model_obj = getattr(model, 'roberta', getattr(model, 'bert', None))
+                if base_model_obj is not None:
+                    if (self.config.gradual_unfreeze and i == 0):
+                        for param in base_model_obj.parameters():
+                            param.requires_grad = False
 
-                if (step % (step_number // 3)) == 0:
-                    i += 1
+                    if (step % max(1, (step_number // 3))) == 0:
+                        i += 1
 
-                if (self.config.gradual_unfreeze and i > 1 and i < self.config.encoder_no):
+                    if (self.config.gradual_unfreeze and i > 1 and i < self.config.encoder_no):
 
-                    for k in range(i - 1):
+                        for k in range(i - 1):
 
-                        try:
-                            for param in model.bert.encoder.layer[self.config.encoder_no - 1 - k].parameters():
-                                param.requires_grad = True
-                        except:
-                            pass
+                            try:
+                                for param in base_model_obj.encoder.layer[self.config.encoder_no - 1 - k].parameters():
+                                    param.requires_grad = True
+                            except:
+                                pass
 
-                if (self.config.gradual_unfreeze and i > self.config.encoder_no + 1):
-                    for param in model.bert.embeddings.parameters():
-                        param.requires_grad = True
+                    if (self.config.gradual_unfreeze and i > self.config.encoder_no + 1):
+                        for param in base_model_obj.embeddings.parameters():
+                            param.requires_grad = True
 
                 batch = tuple(t.to(self.device) for t in batch)
 
                 input_ids, attention_mask, token_type_ids, label_ids, agree_ids = batch
 
-                logits = model(input_ids, attention_mask, token_type_ids)[0]
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits
                 weights = self.class_weights.to(self.device)
 
                 if self.config.output_mode == "classification":
@@ -450,12 +571,11 @@ class FinBert(object):
             for input_ids, attention_mask, token_type_ids, label_ids, agree_ids in tqdm(validation_loader, desc="Validating"):
                 input_ids = input_ids.to(self.device)
                 attention_mask = attention_mask.to(self.device)
-                token_type_ids = token_type_ids.to(self.device)
                 label_ids = label_ids.to(self.device)
-                agree_ids = agree_ids.to(self.device)
 
                 with torch.no_grad():
-                    logits = model(input_ids, attention_mask, token_type_ids)[0]
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    logits = outputs.logits
 
                     if self.config.output_mode == "classification":
                         loss_fct = CrossEntropyLoss(weight=weights)
@@ -476,23 +596,22 @@ class FinBert(object):
             if valid_loss == min(self.validation_losses):
 
                 try:
-                    os.remove(self.config.model_dir / ('temporary' + str(best_model)))
+                    os.remove(os.path.join(self.config.model_dir, 'temporary' + str(best_model)))
                 except:
                     print('No best model found')
                 torch.save({'epoch': str(i), 'state_dict': model.state_dict()},
-                           self.config.model_dir / ('temporary' + str(i)))
+                           os.path.join(self.config.model_dir, 'temporary' + str(i)))
                 best_model = i
 
         # Save a trained model and the associated configuration
-        checkpoint = torch.load(self.config.model_dir / ('temporary' + str(best_model)))
+        checkpoint = torch.load(os.path.join(self.config.model_dir, 'temporary' + str(best_model)))
         model.load_state_dict(checkpoint['state_dict'])
-        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-        output_model_file = os.path.join(self.config.model_dir, WEIGHTS_NAME)
-        torch.save(model_to_save.state_dict(), output_model_file)
-        output_config_file = os.path.join(self.config.model_dir, CONFIG_NAME)
-        with open(output_config_file, 'w') as f:
-            f.write(model_to_save.config.to_json_string())
-        os.remove(self.config.model_dir / ('temporary' + str(best_model)))
+        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model itself
+        model_to_save.save_pretrained(self.config.model_dir)
+        try:
+            os.remove(os.path.join(self.config.model_dir, 'temporary' + str(best_model)))
+        except:
+            pass
         return model
 
     def evaluate(self, model, examples):
@@ -528,12 +647,12 @@ class FinBert(object):
         for input_ids, attention_mask, token_type_ids, label_ids, agree_ids in tqdm(eval_loader, desc="Testing"):
             input_ids = input_ids.to(self.device)
             attention_mask = attention_mask.to(self.device)
-            token_type_ids = token_type_ids.to(self.device)
             label_ids = label_ids.to(self.device)
             agree_ids = agree_ids.to(self.device)
 
             with torch.no_grad():
-                logits = model(input_ids, attention_mask, token_type_ids)[0]
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits
 
                 if self.config.output_mode == "classification":
                     loss_fct = CrossEntropyLoss()
@@ -560,18 +679,8 @@ class FinBert(object):
 
                 text_ids.append(input_ids)
 
-                # tmp_eval_loss = loss_fct(logits.view(-1, self.num_labels), label_ids.view(-1))
-                # tmp_eval_loss = model(input_ids, token_type_ids, attention_mask, label_ids)
-
                 eval_loss += tmp_eval_loss.mean().item()
                 nb_eval_steps += 1
-
-            # logits = logits.detach().cpu().numpy()
-            # label_ids = label_ids.to('cpu').numpy()
-            # tmp_eval_accuracy = accuracy(logits, label_ids)
-
-            # eval_loss += tmp_eval_loss.mean().item()
-            # eval_accuracy += tmp_eval_accuracy
 
         evaluation_df = pd.DataFrame({'predictions': predictions, 'labels': labels, "agree_levels": agree_levels})
 
@@ -580,14 +689,14 @@ class FinBert(object):
 
 def predict(text, model, write_to_csv=False, path=None, use_gpu=False, gpu_name='cuda:0', batch_size=5):
     """
-    Predict sentiments of sentences in a given text. The function first tokenizes sentences, make predictions and write
+    Predict sentiments of sentences in a given text. The function first tokenizes sentences, makes predictions and writes
     results.
     Parameters
     ----------
     text: string
         text to be analyzed
-    model: BertForSequenceClassification
-        path to the classifier model
+    model: SentimentEngine or BertForSequenceClassification
+        the sentiment model/engine
     write_to_csv (optional): bool
     path (optional): string
         path to write the string
@@ -598,43 +707,10 @@ def predict(text, model, write_to_csv=False, path=None, use_gpu=False, gpu_name=
     batch_size: (optional): int
         size of batching chunks
     """
-    model.eval()
+    if isinstance(model, SentimentEngine):
+        return model.predict(text, write_to_csv=write_to_csv, path=path, use_gpu=use_gpu, gpu_name=gpu_name, batch_size=batch_size)
 
-    sentences = sent_tokenize(text)
-
-    device = gpu_name if use_gpu and torch.cuda.is_available() else "cpu"
-    logging.info("Using device: %s " % device)
-    label_list = ['positive', 'negative', 'neutral']
-    label_dict = {0: 'positive', 1: 'negative', 2: 'neutral'}
-    result = pd.DataFrame(columns=['sentence', 'logit', 'prediction', 'sentiment_score'])
-    for batch in chunks(sentences, batch_size):
-        examples = [InputExample(str(i), sentence) for i, sentence in enumerate(batch)]
-
-        features = convert_examples_to_features(examples, label_list, 64, tokenizer)
-
-        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long).to(device)
-        all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long).to(device)
-        all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long).to(device)
-
-        with torch.no_grad():
-            model     = model.to(device)
-
-            logits = model(all_input_ids, all_attention_mask, all_token_type_ids)[0]
-            logging.info(logits)
-            logits = softmax(np.array(logits.cpu()))
-            sentiment_score = pd.Series(logits[:, 0] - logits[:, 1])
-            predictions = np.squeeze(np.argmax(logits, axis=1))
-
-            batch_result = {'sentence': batch,
-                            'logit': list(logits),
-                            'prediction': predictions,
-                            'sentiment_score': sentiment_score}
-
-            batch_result = pd.DataFrame(batch_result)
-            result = pd.concat([result, batch_result], ignore_index=True)
-
-    result['prediction'] = result.prediction.apply(lambda x: label_dict[x])
-    if write_to_csv:
-        result.to_csv(path, sep=',', index=False)
-
-    return result
+    # If it is a raw model, wrap it in a temporary SentimentEngine for backwards compatibility
+    engine = SentimentEngine()
+    engine.model = model
+    return engine.predict(text, write_to_csv=write_to_csv, path=path, use_gpu=use_gpu, gpu_name=gpu_name, batch_size=batch_size)

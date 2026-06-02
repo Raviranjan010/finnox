@@ -1,5 +1,4 @@
-from finbert.finbert import predict
-from transformers import AutoModelForSequenceClassification
+from finbert.finbert import SentimentEngine
 import argparse
 import os
 
@@ -21,7 +20,7 @@ if not os.path.exists(args.output_dir):
 with open(args.text_path,'r') as f:
     text = f.read()
 
-model = AutoModelForSequenceClassification.from_pretrained(args.model_path,num_labels=3,cache_dir=None)
+model = SentimentEngine(args.model_path)
 
 output = "predictions.csv"
-predict(text,model,write_to_csv=True,path=os.path.join(args.output_dir,output))
+model.predict(text,write_to_csv=True,path=os.path.join(args.output_dir,output))
