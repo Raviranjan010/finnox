@@ -17,3 +17,5 @@
 
 from finbert.finbert import SentimentEngine, Config, FinBert, predict
 from finbert.ingestion import NewsIngestionPipeline, Article
+from finbert.ner import EntitySentimentTracker
+from finbert.explain import SentimentExplainer

@@ -16,7 +16,6 @@ dependencies:
   - pip:
     - joblib==0.13.2
     - scikit-learn==0.21.2
-    - spacy==2.1.4
     - torch==1.1.0
     - textblob
     - fastapi
@@ -24,3 +23,7 @@ dependencies:
     - celery[redis]
     - redis
     - httpx
+    - spacy>=3.0.0
+    - spacy-transformers
+    - shap
+    - numba

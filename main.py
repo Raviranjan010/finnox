@@ -8,6 +8,8 @@ import uvicorn
 
 from finbert.finbert import SentimentEngine
 from finbert.ingestion import NewsIngestionPipeline
+from finbert.ner import EntitySentimentTracker
+from finbert.explain import SentimentExplainer
 from tasks import broker
 
 # Ensure NLTK data is downloaded
@@ -30,22 +32,67 @@ app.add_middleware(
 MODEL_PATH = os.getenv("MODEL_PATH", "/src/models/classifier_model/finbert-sentiment")
 model = SentimentEngine(MODEL_PATH)
 
+# Lazy loaded entities tracker & explainers
+tracker = None
+explainer = None
+
+def get_tracker():
+    global tracker
+    if tracker is None:
+        tracker = EntitySentimentTracker(model)
+    return tracker
+
+def get_explainer():
+    global explainer
+    if explainer is None:
+        explainer = SentimentExplainer(model.model, model.tokenizer)
+    return explainer
+
 @app.post("/")
 async def score(data: dict = Body(...)):
-    """Predict sentiment of a single text (synchronous, backwards compatible)."""
+    """Predict sentiment of a single text with optional NER and SHAP explanations."""
     text = data.get('text')
     if not text:
         raise HTTPException(status_code=400, detail="Missing 'text' key in request body")
+    
+    explain_req = data.get('explain', False)
+    ner_req = data.get('ner', False)
+    
     try:
         pred_df = model.predict(text)
-        return pred_df.to_dict(orient='records')
+        predictions = pred_df.to_dict(orient='records')
+        
+        if explain_req or ner_req:
+            # Build doc-level sentiment based on highest-confidence sentence prediction
+            best_pred = {}
+            if predictions:
+                best_pred = max(predictions, key=lambda x: x.get("confidence", 0.0))
+            doc_sentiment = {
+                "label": best_pred.get("prediction", "neutral"),
+                "confidence": best_pred.get("confidence", 1.0)
+            }
+            
+            response = {
+                "predictions": predictions
+            }
+            if ner_req:
+                response["entities"] = get_tracker().extract_entity_sentiment(text, doc_sentiment)
+            if explain_req:
+                response["explanation"] = get_explainer().explain(text)
+            return response
+            
+        # Default list of predictions directly for strict backwards compatibility
+        return predictions
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/news")
 async def analyze_news(data: dict = Body(default={})):
-    """Ingest articles for tickers and predict sentiments (async I/O, sync inference)."""
+    """Ingest articles for tickers and predict sentiments (with optional NER and SHAP)."""
     tickers = data.get('tickers', [])
+    explain_req = data.get('explain', False)
+    ner_req = data.get('ner', False)
+    
     pipeline = NewsIngestionPipeline()
     try:
         articles = await pipeline.ingest(tickers)
@@ -56,13 +103,30 @@ async def analyze_news(data: dict = Body(default={})):
     for article in articles:
         pred_df = model.predict(article.text)
         predictions = pred_df.to_dict(orient='records')
-        results.append({
+        
+        item = {
             "ticker_mentions": article.ticker_mentions,
             "source": article.source,
             "published": article.published,
             "text": article.text,
             "predictions": predictions
-        })
+        }
+        
+        if explain_req or ner_req:
+            best_pred = {}
+            if predictions:
+                best_pred = max(predictions, key=lambda x: x.get("confidence", 0.0))
+            doc_sentiment = {
+                "label": best_pred.get("prediction", "neutral"),
+                "confidence": best_pred.get("confidence", 1.0)
+            }
+            
+            if ner_req:
+                item["entities"] = get_tracker().extract_entity_sentiment(article.text, doc_sentiment)
+            if explain_req:
+                item["explanation"] = get_explainer().explain(article.text)
+                
+        results.append(item)
     return {"results": results}
 
 @app.post("/analyze/batch")
