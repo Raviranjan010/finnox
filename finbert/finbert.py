@@ -16,7 +16,8 @@ from finbert.utils import *
 import numpy as np
 import logging
 
-from transformers.optimization import AdamW, get_linear_schedule_with_warmup
+from transformers.optimization import get_linear_schedule_with_warmup
+from torch.optim import AdamW
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
 
 logger = logging.getLogger(__name__)

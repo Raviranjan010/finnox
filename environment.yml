@@ -19,3 +19,8 @@ dependencies:
     - spacy==2.1.4
     - torch==1.1.0
     - textblob
+    - fastapi
+    - uvicorn
+    - celery[redis]
+    - redis
+    - httpx
